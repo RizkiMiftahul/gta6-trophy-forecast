@@ -4,6 +4,7 @@ import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import variance
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -56,6 +57,19 @@ def median(values):
     return vals[n//2] if n % 2 else (vals[n//2-1] + vals[n//2]) / 2
 
 
+def weighted_median(entries):
+    ordered = sorted(entries)
+    half = sum(weight for _, weight in ordered) / 2
+    cumulative = 0.0
+    for i, (value, weight) in enumerate(ordered):
+        cumulative += weight
+        if cumulative > half:
+            return value
+        if cumulative == half and i + 1 < len(ordered):
+            return (value + ordered[i + 1][0]) / 2
+    return ordered[-1][0]
+
+
 def forecast_case(case):
     if case.get("levels") != LEVELS:
         raise ValueError("unexpected quantile levels")
@@ -77,15 +91,29 @@ def forecast_case(case):
     horizon = max(0.0, (parse_time(case["target"])-ts[-1])/3600)
     weights = [2 ** (-(ts[-1]-t)/3600/24) for t in ts]
     players = [s["players"] for s in states]
-    pfit = weighted_fit(hours, [math.log(p) for p in players], weights) if len(states) >= 2 else None
-    p_slope = pfit[1] if pfit else 0.0
-    log_p_target = math.log(players[-1]) + 0.5*p_slope*horizon
-    player_target = max(players[-1], math.exp(log_p_target))
-    log_p_target = math.log(player_target)
+    log_players = [math.log(p) for p in players]
+    state_ends = ts[1:] + [parse_time(history[-1]["at"])]
+    for j in range(1, len(states)):
+        duration = max(0.0, (state_ends[j] - ts[j]) / 3600)
+        # Large downward revisions can make the square root undefined.
+        movement = math.sqrt(max(0.0, 1 + log_players[j] - log_players[j - 1]))
+        weights[j] *= movement * (1 + math.log1p(duration))
+
+    pfit = weighted_fit(hours, log_players, weights)
+    log_hours = [math.log1p(h) for h in hours]
+    saturating_fit = weighted_fit(log_hours, log_players, weights)
+    player_span = horizon
+    if saturating_fit and (pfit is None or saturating_fit[2] < pfit[2]):
+        pfit = saturating_fit
+        player_span = math.log1p(hours[-1] + horizon) - log_hours[-1]
+    log_p_change = max(0.0, 0.5 * pfit[1] * player_span) if pfit else 0.0
+    log_p_target = log_players[-1] + log_p_change
 
     fits = []
     eta_pool = {tier: [] for tier in TIERS}
     growth_pool = {tier: [] for tier in TIERS}
+    jump_pool = {tier: [] for tier in TIERS}
+    refreshes = [j for j in range(1, len(states)) if players[j] != players[j - 1]]
     for i, trophy in enumerate(case["trophies"]):
         points = [(j, s["time"], s["players"], float(s["rates"][i]) / 100 * s["players"])
                   for j, s in enumerate(states) if s["rates"][i] is not None
@@ -99,34 +127,67 @@ def forecast_case(case):
             eta_fit = weighted_fit(px, ey, pw) if len(set(px)) >= 2 else None
             if eta_fit:
                 eta = eta_fit[1]
-                eta_pool.get(trophy["tier"], []).append(eta)
+                eta_pool.get(trophy["tier"], []).append((eta, sum(pw)))
             tx = [hours[j] for j, _, _, _ in points]
             efit = weighted_fit(tx, ey, pw) if len(set(tx)) >= 2 else None
             if efit:
-                growth_pool.get(trophy["tier"], []).append(efit[1])
-        fits.append((points, eta, efit))
+                growth_pool.get(trophy["tier"], []).append((efit[1], sum(pw)))
+        jumps = []
+        elapsed_days = 0.0
+        for j in refreshes:
+            before, after = states[j - 1]["rates"][i], states[j]["rates"][i]
+            if before is not None and after is not None:
+                jumps.append(logit(float(after)) - logit(float(before)))
+                elapsed_days += (hours[j] - hours[j - 1]) / 24
+        jumpvar = None
+        if len(jumps) >= 2 and elapsed_days > 0:
+            jumpvar = variance(jumps) * len(jumps) / elapsed_days
+            jump_pool.get(trophy["tier"], []).append(jumpvar)
+        fits.append((points, eta, efit, jumpvar))
 
-    eta_medians = {tier: median(v) for tier, v in eta_pool.items() if v}
-    growth_medians = {tier: median(v) for tier, v in growth_pool.items() if v}
-    stale = len(states) == 1 and horizon >= 0.5
-    stale_shift = min(0.35, 0.10 * math.sqrt(horizon / 1.5)) if stale else 0.0
-    rows = []
-    for index, (trophy, (points, eta, efit)) in enumerate(zip(case["trophies"], fits)):
+    eta_medians = {tier: weighted_median(v) for tier, v in eta_pool.items() if v}
+    growth_medians = {tier: weighted_median(v) for tier, v in growth_pool.items() if v}
+    jump_medians = {tier: median(v) for tier, v in jump_pool.items() if v}
+    pooled = []
+    for trophy, (_, eta, efit, _) in zip(case["trophies"], fits):
         tier = trophy["tier"]
         eta = (0.5*eta + 0.5*eta_medians[tier]) if eta is not None and tier in eta_medians else (eta if eta is not None else eta_medians.get(tier, 1.0))
         growth = efit[1] if efit else None
         growth = (0.5*growth + 0.5*growth_medians[tier]) if growth is not None and tier in growth_medians else (growth if growth is not None else growth_medians.get(tier, 0.0))
+        pooled.append((eta, growth))
+
+    last_rates = states[-1]["rates"]
+    # Use the last rate to break elasticity ties at the tercile boundaries.
+    ranked = sorted(range(len(pooled)), key=lambda i: (pooled[i][0], float(last_rates[i] or 0)))
+    maturity = [0.0] * len(pooled)
+    damped_horizon = 0.5 * horizon
+    for group in range(3):
+        members = ranked[group * len(ranked) // 3:(group + 1) * len(ranked) // 3]
+        if members:
+            group_growth = median([pooled[i][1] for i in members])
+            for i in members:
+                maturity[i] = (group_growth - pooled[i][1]) * 0.25 * damped_horizon
+
+    stale = len(states) == 1 and horizon >= 0.5
+    stale_shift = min(0.35, 0.10 * math.sqrt(horizon / 1.5)) if stale else 0.0
+    horizon_days = horizon / 24
+    rows = []
+    for index, (trophy, (points, _, efit, jumpvar)) in enumerate(zip(case["trophies"], fits)):
+        eta, growth = pooled[index]
+        last_rate = last_rates[index]
         if points:
             last_e = points[-1][3]
-            log_e_target = math.log(last_e) + eta*(log_p_target-math.log(players[-1])) + growth*horizon*0.5
-            earners_target = math.exp(log_e_target)
-            center_rate = clamp(100*earners_target/player_target)
+            log_e_target = math.log(last_e) + eta * log_p_change + growth * damped_horizon + maturity[index]
+            log_rate = math.log(100) + log_e_target - log_p_target
+            center_rate = math.exp(min(math.log(99.99), max(math.log(0.01), log_rate)))
         else:
             # Keep null and zero-rate trophies at the last observed rate.
-            last_rate = states[-1]["rates"][len(rows)]
             center_rate = clamp(float(last_rate)) if last_rate is not None else 0.01
         resid = efit[2] if efit else 0.0
-        sigma = math.sqrt((0.35*math.sqrt(horizon/24))**2 + resid**2 + 0.03)
+        if jumpvar is None:
+            jumpvar = jump_medians.get(trophy["tier"], 0.0)
+        sigma = math.sqrt((0.35 * math.sqrt(horizon_days))**2 + resid**2
+                          + jumpvar * min(1, horizon_days / 4.52) + 0.03)
         if stale:
             sigma += 0.30
         sigma = min(1.6, sigma)
@@ -137,7 +198,6 @@ def forecast_case(case):
             if qs:
                 value = max(qs[-1], value)
             qs.append(value)
-        last_rate = states[-1]["rates"][index]
         if last_rate is not None and float(last_rate) >= 99.99 and eta >= 0.9:
             qs[0] = max(90.0, qs[0])
         rows.append({"id": trophy["id"], "q": qs})
