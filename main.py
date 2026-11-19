@@ -1,17 +1,15 @@
-"""Forecast GTA VI trophy earn rates from the case's observed history."""
+"""Refresh-aware forecast of GTA VI trophy earn rates."""
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc).timestamp()
+TIERS = ("platinum", "gold", "silver", "bronze")
 
 
 def clamp(x):
@@ -24,7 +22,7 @@ def logit(pct):
 
 
 def round4(x):
-    """Round to four decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 does."""
+    """Round to four decimals, half up, as JavaScript Math.round does."""
     scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -64,57 +62,84 @@ def forecast_case(case):
     history = case["history"]
     if not history:
         raise ValueError("case has no history")
-    ts = [parse_time(row["at"]) for row in history]
+
+    # A state marks a distinct Exophase snapshot; repeated reads add no evidence.
+    states = []
+    for row in history:
+        signature = (row["players_tracked"], tuple(row["rates"]))
+        if not states or signature != states[-1]["signature"]:
+            states.append({"signature": signature, "time": parse_time(row["at"]),
+                           "players": float(row["players_tracked"]), "rates": row["rates"]})
+
+    ts = [s["time"] for s in states]
     first = ts[0]
     hours = [(t-first)/3600 for t in ts]
-    players = [float(row["players_tracked"]) for row in history]
-    target_ts = parse_time(case["target"])
-    horizon = max(0.0, (target_ts-ts[-1])/3600)
-    if len(set(players)) >= 2:
-        pfit = weighted_fit(hours, [math.log(p) for p in players], [1.0]*len(players))
-        slope = max(0.0, pfit[1])
-        log_p_target = math.log(players[-1]) + slope * horizon * 0.5
-    else:
-        log_p_target = math.log(players[-1])
-    tier_slopes = {tier: [] for tier in ("platinum", "gold", "silver", "bronze")}
+    horizon = max(0.0, (parse_time(case["target"])-ts[-1])/3600)
+    weights = [2 ** (-(ts[-1]-t)/3600/24) for t in ts]
+    players = [s["players"] for s in states]
+    pfit = weighted_fit(hours, [math.log(p) for p in players], weights) if len(states) >= 2 else None
+    p_slope = pfit[1] if pfit else 0.0
+    log_p_target = math.log(players[-1]) + 0.5*p_slope*horizon
+    player_target = max(players[-1], math.exp(log_p_target))
+    log_p_target = math.log(player_target)
+
     fits = []
+    eta_pool = {tier: [] for tier in TIERS}
+    growth_pool = {tier: [] for tier in TIERS}
     for i, trophy in enumerate(case["trophies"]):
-        points = [(t, rate) for t, row in zip(ts, history) if (rate := row["rates"][i]) is not None]
-        xs = [math.log1p(max(0.0, (t-RELEASE)/3600)) for t, _ in points]
-        ys = [logit(rate) for _, rate in points]
-        ages = [(target_ts-t)/3600 for t, _ in points]
-        weights = [2 ** (-max(0.0, age)/12) for age in ages]
-        trend_fit = weighted_fit(xs, ys, weights) if len(points) >= 3 and len(set(xs)) >= 2 else None
-        lx = [math.log(float(row["players_tracked"])) for row in history if row["rates"][i] is not None]
-        dilution_fit = weighted_fit(lx, ys, weights) if len(points) >= 3 and len(set(lx)) >= 2 else None
-        if dilution_fit is not None and trophy["tier"] in tier_slopes:
-            tier_slopes[trophy["tier"]].append(dilution_fit[1])
-        fits.append((points, trend_fit, dilution_fit, xs, ys, weights))
-    pooled = {tier: median(vals) for tier, vals in tier_slopes.items() if vals}
+        points = [(j, s["time"], s["players"], float(s["rates"][i]) / 100 * s["players"])
+                  for j, s in enumerate(states) if s["rates"][i] is not None
+                  and float(s["rates"][i]) > 0]
+        efit = None
+        eta = None
+        if len(points) >= 2:
+            px = [math.log(p) for _, _, p, _ in points]
+            ey = [math.log(e) for _, _, _, e in points]
+            pw = [weights[j] for j, _, _, _ in points]
+            eta_fit = weighted_fit(px, ey, pw) if len(set(px)) >= 2 else None
+            if eta_fit:
+                eta = eta_fit[1]
+                eta_pool.get(trophy["tier"], []).append(eta)
+            tx = [hours[j] for j, _, _, _ in points]
+            efit = weighted_fit(tx, ey, pw) if len(set(tx)) >= 2 else None
+            if efit:
+                growth_pool.get(trophy["tier"], []).append(efit[1])
+        fits.append((points, eta, efit))
+
+    eta_medians = {tier: median(v) for tier, v in eta_pool.items() if v}
+    growth_medians = {tier: median(v) for tier, v in growth_pool.items() if v}
+    stale = len(states) == 1 and horizon >= 0.5
+    stale_shift = min(0.35, 0.10 * math.sqrt(horizon / 1.5)) if stale else 0.0
     rows = []
-    for i, (trophy, fit) in enumerate(zip(case["trophies"], fits)):
-        points, trend_fit, dilution_fit, xs, ys, weights = fit
-        trend_value = trend_fit[0] + trend_fit[1] * math.log1p(max(0.0, (target_ts-RELEASE)/3600)) if trend_fit else None
-        dilution_value = None
-        if dilution_fit:
-            slope = dilution_fit[1]
-            tier = trophy["tier"]
-            if tier in pooled:
-                slope = 0.5*slope + 0.5*pooled[tier]
-            dilution_value = dilution_fit[0] + slope*log_p_target
-        available = [v for v in (trend_value, dilution_value) if v is not None]
-        last_rate = points[-1][1] if points else 0.0
-        center = sum(available)/len(available) if available else logit(last_rate)
-        resid = trend_fit[2] if trend_fit else 0.0
-        growth = max(0.0, log_p_target - math.log(players[-1]))
-        floor_var = 0.04 + 0.25 * growth**2
-        sigma = min(1.6, math.sqrt((0.5*math.sqrt(horizon/24))**2 + resid**2 + floor_var))
+    for index, (trophy, (points, eta, efit)) in enumerate(zip(case["trophies"], fits)):
+        tier = trophy["tier"]
+        eta = (0.5*eta + 0.5*eta_medians[tier]) if eta is not None and tier in eta_medians else (eta if eta is not None else eta_medians.get(tier, 1.0))
+        growth = efit[1] if efit else None
+        growth = (0.5*growth + 0.5*growth_medians[tier]) if growth is not None and tier in growth_medians else (growth if growth is not None else growth_medians.get(tier, 0.0))
+        if points:
+            last_e = points[-1][3]
+            log_e_target = math.log(last_e) + eta*(log_p_target-math.log(players[-1])) + growth*horizon*0.5
+            earners_target = math.exp(log_e_target)
+            center_rate = clamp(100*earners_target/player_target)
+        else:
+            # Keep null and zero-rate trophies at the last observed rate.
+            last_rate = states[-1]["rates"][len(rows)]
+            center_rate = clamp(float(last_rate)) if last_rate is not None else 0.01
+        resid = efit[2] if efit else 0.0
+        sigma = math.sqrt((0.35*math.sqrt(horizon/24))**2 + resid**2 + 0.03)
+        if stale:
+            sigma += 0.30
+        sigma = min(1.6, sigma)
+        center = logit(center_rate) - stale_shift
         qs = []
         for z in Z:
             value = round4(clamp(100/(1+math.exp(-(center+z*sigma)))))
             if qs:
                 value = max(qs[-1], value)
             qs.append(value)
+        last_rate = states[-1]["rates"][index]
+        if last_rate is not None and float(last_rate) >= 99.99 and eta >= 0.9:
+            qs[0] = max(90.0, qs[0])
         rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
 
