@@ -1,4 +1,5 @@
-"""Refresh-aware forecast of GTA VI trophy earn rates."""
+"""Refresh-aware forecast of GTA VI trophy earn rates.
+v4: degenerate-history refresh regime, integer earners, refresh-interval splitting, cadence-based spread."""
 import json
 import math
 import os
@@ -10,6 +11,9 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
+REFRESH_G_BASE = 6.0
+REFRESH_G_MIN = 1.5
+REFRESH_G_MAX = 12.0
 TIERS = ("platinum", "gold", "silver", "bronze")
 
 
@@ -232,9 +236,9 @@ def forecast_case(case):
             case_time = parse_time(case.get("at", history[-1]["at"]))
             release_age_hours = (case_time - release_time) / 3600
             near_release = -24 <= release_age_hours <= 36
-        base_growth = 6.0 if near_release else 1.6
+        base_growth = REFRESH_G_BASE if near_release else 1.6
         horizon_hours = case_horizon_minutes / 60
-        player_multiplier = min(12.0, max(1.5, base_growth ** (case_horizon_minutes / 90.0)))
+        player_multiplier = min(REFRESH_G_MAX, max(REFRESH_G_MIN, base_growth ** (case_horizon_minutes / 90.0)))
         target_players = players[-1] * player_multiplier
         earner_growth = min(0.10, 0.02 * horizon_hours)
 
