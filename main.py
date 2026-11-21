@@ -70,6 +70,13 @@ def weighted_median(entries):
     return ordered[-1][0]
 
 
+def integer_earners(rate, players):
+    """Recover the integer earner count represented by a printed page rate."""
+    if rate is None:
+        return None
+    return max(0, int(math.floor(float(rate) * float(players) / 100.0 + 0.5)))
+
+
 def forecast_case(case):
     if case.get("levels") != LEVELS:
         raise ValueError("unexpected quantile levels")
@@ -92,6 +99,14 @@ def forecast_case(case):
     weights = [2 ** (-(ts[-1]-t)/3600/24) for t in ts]
     players = [s["players"] for s in states]
     log_players = [math.log(p) for p in players]
+    earner_states = [
+        [integer_earners(rate, s["players"]) for rate in s["rates"]]
+        for s in states
+    ]
+    interval_gaps = [(ts[j] - ts[j - 1]) / 60 for j in range(1, len(states))
+                     if ts[j] > ts[j - 1]]
+    cadence_minutes = median(interval_gaps) if interval_gaps else None
+    jump_flags = [players[j] > players[j - 1] * 1.2 for j in range(1, len(states))]
     state_ends = ts[1:] + [parse_time(history[-1]["at"])]
     for j in range(1, len(states)):
         duration = max(0.0, (state_ends[j] - ts[j]) / 3600)
@@ -113,25 +128,56 @@ def forecast_case(case):
     eta_pool = {tier: [] for tier in TIERS}
     growth_pool = {tier: [] for tier in TIERS}
     jump_pool = {tier: [] for tier in TIERS}
-    refreshes = [j for j in range(1, len(states)) if players[j] != players[j - 1]]
+    refreshes = [j for j in range(1, len(states)) if jump_flags[j - 1]]
+    lag_by_trophy = []
     for i, trophy in enumerate(case["trophies"]):
-        points = [(j, s["time"], s["players"], float(s["rates"][i]) / 100 * s["players"])
+        points = [(j, s["time"], s["players"], earner_states[j][i])
                   for j, s in enumerate(states) if s["rates"][i] is not None
-                  and float(s["rates"][i]) > 0]
+                  and earner_states[j][i] is not None and earner_states[j][i] > 0]
         efit = None
         eta = None
+        nonjump_growth = []
+        jump_growth = []
+        jump_fractions = []
+        for j in range(1, len(states)):
+            before, after = earner_states[j - 1][i], earner_states[j][i]
+            dt = (ts[j] - ts[j - 1]) / 3600
+            if before is None or after is None or before <= 0 or after <= 0 or dt <= 0:
+                continue
+            growth = math.log(after / before) / dt
+            entry_weight = (weights[j] + weights[j - 1]) / 2
+            if jump_flags[j - 1]:
+                jump_growth.append((growth, entry_weight, dt))
+            else:
+                nonjump_growth.append((growth, entry_weight))
+        steady_growth = weighted_median(nonjump_growth) if nonjump_growth else None
+        if steady_growth is not None:
+            for jump_rate, jump_weight, dt in jump_growth:
+                expected = max(0.0, steady_growth * dt)
+                observed = max(0.0, jump_rate * dt)
+                if expected > 1e-9:
+                    jump_fractions.append((min(1.0, observed / expected), jump_weight))
+        lag_fraction = (weighted_median(jump_fractions) if jump_fractions else 0.25)
+        lag_fraction = min(1.0, max(0.0, lag_fraction))
+        lag_by_trophy.append(lag_fraction)
         if len(points) >= 2:
             px = [math.log(p) for _, _, p, _ in points]
             ey = [math.log(e) for _, _, _, e in points]
-            pw = [weights[j] for j, _, _, _ in points]
+            # A refresh interval can hide ordinary earner progress. Keep it in
+            # the fit, but give its endpoint only the learned lag weight.
+            pw = [weights[j] * (lag_fraction if j > 0 and jump_flags[j - 1] else 1.0)
+                  for j, _, _, _ in points]
             eta_fit = weighted_fit(px, ey, pw) if len(set(px)) >= 2 else None
             if eta_fit:
                 eta = eta_fit[1]
                 eta_pool.get(trophy["tier"], []).append((eta, sum(pw)))
             tx = [hours[j] for j, _, _, _ in points]
-            efit = weighted_fit(tx, ey, pw) if len(set(tx)) >= 2 else None
+            growth_weights = [weights[j] * (4.0 if j == 0 or not jump_flags[j - 1]
+                                                else max(0.05, lag_fraction))
+                              for j, _, _, _ in points]
+            efit = weighted_fit(tx, ey, growth_weights) if len(set(tx)) >= 2 else None
             if efit:
-                growth_pool.get(trophy["tier"], []).append((efit[1], sum(pw)))
+                growth_pool.get(trophy["tier"], []).append((efit[1], sum(growth_weights)))
         jumps = []
         elapsed_days = 0.0
         for j in refreshes:
@@ -171,13 +217,47 @@ def forecast_case(case):
     stale = len(states) == 1 and horizon >= 0.5
     stale_shift = min(0.35, 0.10 * math.sqrt(horizon / 1.5)) if stale else 0.0
     horizon_days = horizon / 24
+
+    # A flat/near-empty history gives no evidence about the first page refresh.
+    # Launch night is the one well-supported case where a large jump is likely.
+    case_horizon_minutes = float(case.get("horizon_minutes", horizon * 60))
+    total_player_growth = players[-1] / players[0] - 1.0
+    degenerate = (case_horizon_minutes >= 30 and
+                  (len(states) <= 2 or total_player_growth < 0.05))
+    if degenerate:
+        release = case.get("game", {}).get("release_date")
+        near_release = False
+        if release:
+            release_time = parse_time(release)
+            case_time = parse_time(case.get("at", history[-1]["at"]))
+            release_age_hours = (case_time - release_time) / 3600
+            near_release = -24 <= release_age_hours <= 36
+        base_growth = 6.0 if near_release else 1.6
+        horizon_hours = case_horizon_minutes / 60
+        player_multiplier = min(12.0, max(1.5, base_growth ** (case_horizon_minutes / 90.0)))
+        target_players = players[-1] * player_multiplier
+        earner_growth = min(0.10, 0.02 * horizon_hours)
+
     rows = []
     for index, (trophy, (points, _, efit, jumpvar)) in enumerate(zip(case["trophies"], fits)):
         eta, growth = pooled[index]
         last_rate = last_rates[index]
-        if points:
+        if degenerate:
+            last_e = earner_states[-1][index] or 0
+            if last_rate is not None and float(last_rate) >= 99.99:
+                center_rate = 99.99
+            else:
+                center_rate = 100.0 * last_e * (1.0 + earner_growth) / target_players
+                center_rate = min(99.99, max(0.01, center_rate))
+        elif points:
             last_e = points[-1][3]
-            log_e_target = math.log(last_e) + eta * log_p_change + growth * damped_horizon + maturity[index]
+            forecast_lag = 1.0
+            if cadence_minutes and cadence_minutes > 0:
+                cadence_ratio = horizon * 60 / cadence_minutes
+                if 0.5 <= cadence_ratio <= 1.5:
+                    forecast_lag = lag_by_trophy[index]
+            log_e_target = math.log(last_e) + forecast_lag * (eta * log_p_change) \
+                           + forecast_lag * growth * damped_horizon + maturity[index]
             log_rate = math.log(100) + log_e_target - log_p_target
             center_rate = math.exp(min(math.log(99.99), max(math.log(0.01), log_rate)))
         else:
@@ -186,19 +266,26 @@ def forecast_case(case):
         resid = efit[2] if efit else 0.0
         if jumpvar is None:
             jumpvar = jump_medians.get(trophy["tier"], 0.0)
-        sigma = math.sqrt((0.35 * math.sqrt(horizon_days))**2 + resid**2
-                          + jumpvar * min(1, horizon_days / 4.52) + 0.03)
-        if stale:
-            sigma += 0.30
-        sigma = min(1.6, sigma)
-        center = logit(center_rate) - stale_shift
+        if degenerate:
+            sigma = 0.18 + min(0.50, 0.50 / math.sqrt(max(1, earner_states[-1][index] or 0)))
+        else:
+            sigma = math.sqrt((0.35 * math.sqrt(horizon_days))**2 + resid**2
+                              + jumpvar * min(1, horizon_days / 4.52) + 0.03)
+            if stale:
+                sigma += 0.30
+            sigma = min(1.6, sigma)
+            if cadence_minutes and cadence_minutes > 0:
+                cadence_ratio = horizon * 60 / cadence_minutes
+                if 0.5 <= cadence_ratio <= 1.5:
+                    sigma = min(sigma, 0.18 + min(0.50, 0.50 / math.sqrt(max(1, earner_states[-1][index] or 0))))
+        center = logit(center_rate) - (0.0 if degenerate else stale_shift)
         qs = []
         for z in Z:
             value = round4(clamp(100/(1+math.exp(-(center+z*sigma)))))
             if qs:
                 value = max(qs[-1], value)
             qs.append(value)
-        if last_rate is not None and float(last_rate) >= 99.99 and eta >= 0.9:
+        if last_rate is not None and float(last_rate) >= 99.99 and (degenerate or eta >= 0.9):
             qs[0] = max(90.0, qs[0])
         rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
